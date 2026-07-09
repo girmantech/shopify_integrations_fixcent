@@ -9,6 +9,7 @@ from shopify.resources import Product, Variant
 from ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_item import ecommerce_item
 from ecommerce_integrations.shopify.connection import temp_shopify_session
 from ecommerce_integrations.shopify.constants import (
+	IS_SHOPIFY_ITEM_FIELD,
 	ITEM_SELLING_RATE_FIELD,
 	MODULE_NAME,
 	SETTING_DOCTYPE,
@@ -328,6 +329,36 @@ def get_item_code(shopify_item):
 		return item.item_code
 
 
+def should_sync_item_to_shopify(item) -> bool:
+	if item.has_variants:
+		return False
+	return bool(item.get(IS_SHOPIFY_ITEM_FIELD))
+
+
+def unpublish_shopify_product_on_uncheck(doc, template_item) -> None:
+	if not doc.has_value_changed(IS_SHOPIFY_ITEM_FIELD) or doc.get(IS_SHOPIFY_ITEM_FIELD):
+		return
+
+	product_id = frappe.db.get_value(
+		"Ecommerce Item",
+		{"erpnext_item_code": template_item.name, "integration": MODULE_NAME},
+		"integration_item_code",
+	)
+	if not product_id:
+		return
+
+	product = Product.find(product_id)
+	if not product:
+		return
+
+	product.status = "draft"
+	product.published = False
+	is_successful = product.save()
+	write_upload_log(status=is_successful, product=product, item=doc, action="Unpublished")
+	if is_successful:
+		msgprint(_("Status of linked Shopify product is changed to Draft."))
+
+
 @temp_shopify_session
 def upload_erpnext_item(doc, method=None):
 	"""This hook is called when inserting new or updating existing `Item`.
@@ -361,6 +392,10 @@ def upload_erpnext_item(doc, method=None):
 
 	if item.variant_of:
 		template_item = frappe.get_doc("Item", item.variant_of)
+
+	if not should_sync_item_to_shopify(item):
+		unpublish_shopify_product_on_uncheck(doc, template_item)
+		return
 
 	product_id = frappe.db.get_value(
 		"Ecommerce Item",

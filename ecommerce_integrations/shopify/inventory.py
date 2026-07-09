@@ -11,7 +11,7 @@ from ecommerce_integrations.controllers.inventory import (
 )
 from ecommerce_integrations.controllers.scheduling import need_to_run
 from ecommerce_integrations.shopify.connection import temp_shopify_session
-from ecommerce_integrations.shopify.constants import MODULE_NAME, SETTING_DOCTYPE
+from ecommerce_integrations.shopify.constants import IS_SHOPIFY_ITEM_FIELD, MODULE_NAME, SETTING_DOCTYPE
 from ecommerce_integrations.shopify.utils import create_shopify_log
 
 
@@ -29,10 +29,26 @@ def update_inventory_on_shopify() -> None:
 		return
 
 	warehous_map = setting.get_erpnext_to_integration_wh_mapping()
-	inventory_levels = get_inventory_levels(tuple(warehous_map.keys()), MODULE_NAME)
+	inventory_levels = get_shopify_inventory_levels(tuple(warehous_map.keys()))
 
 	if inventory_levels:
 		upload_inventory_data_to_shopify(inventory_levels, warehous_map)
+
+
+def get_shopify_inventory_levels(warehouses: tuple[str]) -> list:
+	inventory_levels = get_inventory_levels(warehouses, MODULE_NAME)
+	if not inventory_levels:
+		return inventory_levels
+
+	item_codes = {d.item_code for d in inventory_levels}
+	shopify_items = set(
+		frappe.get_all(
+			"Item",
+			filters={"name": ["in", list(item_codes)], IS_SHOPIFY_ITEM_FIELD: 1},
+			pluck="name",
+		)
+	)
+	return [d for d in inventory_levels if d.item_code in shopify_items]
 
 
 @temp_shopify_session

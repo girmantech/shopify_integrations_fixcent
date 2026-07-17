@@ -124,6 +124,7 @@ def create_sales_order(shopify_order, setting, company=None):
 			so.update({"company": company, "status": "Draft"})
 		so.flags.ignore_mandatory = True
 		so.flags.shopiy_order_json = json.dumps(shopify_order)
+		_set_item_wise_tax_details(so)
 		so.save(ignore_permissions=True)
 		so.submit()
 
@@ -134,6 +135,51 @@ def create_sales_order(shopify_order, setting, company=None):
 		so = frappe.get_doc("Sales Order", so)
 
 	return so
+
+
+def _set_item_wise_tax_details(so):
+	"""Provide item-wise tax breakup in the format ERPNext v15+ expects.
+
+	Newer ERPNext ignores the legacy `item_wise_tax_detail` JSON while saving and
+	instead maintains `_item_wise_tax_details` (persisted to the "Item Wise Tax
+	Detail" child table). For tax rows marked `dont_recompute_tax` ERPNext skips
+	building this structure, so apps that rely on it (e.g. india_compliance GST
+	validations) see zero item-wise tax and block the transaction.
+	"""
+	if not so.meta.get_field("item_wise_tax_details"):
+		return  # older ERPNext, legacy JSON field is still used
+
+	item_rows = {}
+	for item in so.items:
+		item_rows.setdefault(item.item_code, item)
+
+	details = []
+	for tax in so.taxes:
+		if not tax.get("dont_recompute_tax"):
+			continue
+
+		try:
+			tax_detail = json.loads(tax.item_wise_tax_detail or "{}")
+		except ValueError:
+			continue
+
+		for item_code, (rate, amount) in tax_detail.items():
+			item = item_rows.get(item_code)
+			if not item:
+				continue
+
+			details.append(
+				frappe._dict(
+					item=item,
+					tax=tax,
+					rate=flt(rate),
+					amount=flt(amount),
+					taxable_amount=flt(item.qty) * flt(item.rate),
+				)
+			)
+
+	if details:
+		so._item_wise_tax_details = details
 
 
 def get_order_items(order_items, setting, delivery_date, taxes_inclusive):

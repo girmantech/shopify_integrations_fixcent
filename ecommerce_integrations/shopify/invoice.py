@@ -39,7 +39,10 @@ def create_sales_invoice(shopify_order, setting, so):
 	):
 		posting_date = getdate(shopify_order.get("created_at")) or nowdate()
 
+		from ecommerce_integrations.shopify.order import set_mapped_item_wise_tax_details
+
 		sales_invoice = make_sales_invoice(so.name, ignore_permissions=True)
+		set_mapped_item_wise_tax_details(sales_invoice, so)
 		sales_invoice.set(ORDER_ID_FIELD, str(shopify_order.get("id")))
 		sales_invoice.set(ORDER_NUMBER_FIELD, shopify_order.get("name"))
 		sales_invoice.set_posting_time = 1

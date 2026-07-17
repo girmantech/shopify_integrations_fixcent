@@ -10,7 +10,7 @@ from ecommerce_integrations.shopify.constants import (
 	ORDER_NUMBER_FIELD,
 	SETTING_DOCTYPE,
 )
-from ecommerce_integrations.shopify.order import get_sales_order
+from ecommerce_integrations.shopify.order import get_sales_order, set_mapped_item_wise_tax_details
 from ecommerce_integrations.shopify.utils import create_shopify_log
 
 
@@ -51,6 +51,7 @@ def create_delivery_note(shopify_order, setting, so):
 			dn.items = get_fulfillment_items(
 				dn.items, fulfillment.get("line_items"), fulfillment.get("location_id")
 			)
+			set_mapped_item_wise_tax_details(dn, so)
 			dn.flags.ignore_mandatory = True
 			dn.save()
 			dn.submit()

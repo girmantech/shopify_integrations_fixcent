@@ -182,6 +182,53 @@ def _set_item_wise_tax_details(so):
 		so._item_wise_tax_details = details
 
 
+def set_mapped_item_wise_tax_details(doc, so):
+	"""Copy the Sales Order's persisted item-wise tax breakup onto a document
+	mapped from it (Delivery Note / Sales Invoice).
+
+	`get_mapped_doc` copies tax rows (including `dont_recompute_tax`) but not the
+	"Item Wise Tax Detail" table, so GST validations (india_compliance) would see
+	zero item-wise tax on the mapped document and block it.
+	"""
+	if not so.meta.get_field("item_wise_tax_details"):
+		return  # older ERPNext, legacy JSON field is still used
+
+	so_details = so.get("item_wise_tax_details") or []
+	if not so_details:
+		return
+
+	# tax rows are mapped from the SO in the same order
+	tax_map = {}
+	for so_tax, tax in zip(so.taxes, doc.taxes):
+		tax_map[so_tax.name] = tax
+
+	# mapped item rows reference their SO item row via so_detail
+	item_map = {}
+	for item in doc.items:
+		if item.get("so_detail"):
+			item_map.setdefault(item.so_detail, item)
+
+	details = []
+	for row in so_details:
+		item = item_map.get(row.item_row)
+		tax = tax_map.get(row.tax_row)
+		if not (item and tax):
+			continue
+
+		details.append(
+			frappe._dict(
+				item=item,
+				tax=tax,
+				rate=row.rate,
+				amount=row.amount,
+				taxable_amount=row.taxable_amount,
+			)
+		)
+
+	if details:
+		doc._item_wise_tax_details = details
+
+
 def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 	items = []
 	all_product_exists = True

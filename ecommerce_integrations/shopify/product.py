@@ -5,7 +5,7 @@ from frappe import _, msgprint
 from frappe.utils import cint, cstr
 from frappe.utils.nestedset import get_root_of
 from pyactiveresource.connection import ResourceNotFound
-from shopify.resources import Product, Variant
+from shopify.resources import Image, Product, Variant
 
 from ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_item import ecommerce_item
 from ecommerce_integrations.shopify.connection import temp_shopify_session
@@ -504,6 +504,8 @@ def upload_erpnext_item(doc, method=None):
 				)
 				ecom_item.insert()
 
+			sync_item_image_to_shopify(product, item)
+
 		write_upload_log(status=is_successful, product=product, item=item)
 	elif product and (setting.update_shopify_item_on_update or is_recheck):
 		if is_recheck:
@@ -543,10 +545,16 @@ def upload_erpnext_item(doc, method=None):
 		if is_successful and item.variant_of and setting.update_shopify_item_on_update:
 			map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
 
+		if is_successful and doc.has_value_changed("image"):
+			sync_item_image_to_shopify(product, item)
+
 		action = "Updated"
 		if is_recheck and not setting.update_shopify_item_on_update:
 			action = "Reactivated"
 		write_upload_log(status=is_successful, product=product, item=item, action=action)
+	elif product and doc.has_value_changed("image"):
+		# Image-only change while field updates are disabled.
+		sync_item_image_to_shopify(product, item)
 
 
 def map_erpnext_variant_to_shopify_variant(shopify_product: Product, erpnext_item, variant_attributes):
@@ -598,6 +606,91 @@ def map_erpnext_item_to_shopify(shopify_product: Product, erpnext_item):
 		shopify_product.status = "draft"
 		shopify_product.published = False
 		msgprint(_("Status of linked Shopify product is changed to Draft."))
+
+
+def sync_item_image_to_shopify(shopify_product: Product, erpnext_item) -> None:
+	"""Upload or clear the Shopify product image from the ERPNext Item image field.
+
+	Uses base64 attachment for site files so private/local sites work. Failures are
+	logged and do not block Item save.
+	"""
+	if not shopify_product or not shopify_product.id:
+		return
+
+	try:
+		_clear_shopify_product_images(shopify_product)
+
+		image_url = erpnext_item.get("image")
+		if not image_url:
+			return
+
+		shopify_image = Image({"product_id": shopify_product.id})
+
+		if image_url.startswith(("http://", "https://")):
+			shopify_image.src = image_url
+		else:
+			content, filename = _get_erpnext_image_content(image_url)
+			if not content:
+				create_shopify_log(
+					status="Error",
+					message=_("Could not read Item image file: {0}").format(image_url),
+					method="sync_item_image_to_shopify",
+				)
+				return
+			shopify_image.attach_image(content, filename=filename)
+
+		if not shopify_image.save():
+			errors = (
+				", ".join(shopify_image.errors.full_messages())
+				if getattr(shopify_image, "errors", None)
+				else _("Unknown error")
+			)
+			create_shopify_log(
+				status="Error",
+				request_data=shopify_image.to_dict() if hasattr(shopify_image, "to_dict") else {},
+				message=_("Failed to sync Item image to Shopify: {0}").format(errors),
+				method="sync_item_image_to_shopify",
+			)
+	except Exception:
+		create_shopify_log(
+			status="Error",
+			message=_("Failed to sync Item image to Shopify"),
+			method="sync_item_image_to_shopify",
+			exception=frappe.get_traceback(),
+		)
+
+
+def _clear_shopify_product_images(shopify_product: Product) -> None:
+	"""Remove existing Shopify product images before replacing them."""
+	try:
+		existing_images = Image.find(product_id=shopify_product.id)
+	except ResourceNotFound:
+		return
+
+	for existing in existing_images or []:
+		try:
+			existing.destroy()
+		except Exception:
+			pass
+
+
+def _get_erpnext_image_content(image_url: str) -> tuple[bytes | None, str | None]:
+	"""Return (file bytes, filename) for an ERPNext File URL like /files/... or /private/files/..."""
+	file_name = frappe.db.get_value("File", {"file_url": image_url}, "name")
+	if not file_name:
+		# Item.image sometimes stores only the file name
+		file_name = frappe.db.get_value("File", {"file_name": image_url.rsplit("/", 1)[-1]}, "name")
+
+	if not file_name:
+		return None, None
+
+	file_doc = frappe.get_doc("File", file_name)
+	content = file_doc.get_content()
+	if isinstance(content, str):
+		content = content.encode("utf-8")
+
+	filename = file_doc.file_name or image_url.rsplit("/", 1)[-1]
+	return content, filename
 
 
 def get_shopify_weight_uom(erpnext_weight_uom: str) -> str:

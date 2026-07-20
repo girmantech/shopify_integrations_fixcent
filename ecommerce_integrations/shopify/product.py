@@ -4,6 +4,7 @@ import frappe
 from frappe import _, msgprint
 from frappe.utils import cint, cstr
 from frappe.utils.nestedset import get_root_of
+from pyactiveresource.connection import ResourceNotFound
 from shopify.resources import Product, Variant
 
 from ecommerce_integrations.ecommerce_integrations.doctype.ecommerce_item import ecommerce_item
@@ -335,6 +336,30 @@ def should_sync_item_to_shopify(item) -> bool:
 	return bool(item.get(IS_SHOPIFY_ITEM_FIELD))
 
 
+def get_shopify_product(product_id) -> Product | None:
+	"""Fetch Shopify product by id. Returns None if it was deleted (404)."""
+	try:
+		return Product.find(product_id)
+	except ResourceNotFound:
+		return None
+
+
+def delete_shopify_ecommerce_items(erpnext_item_codes: set[str]) -> None:
+	"""Remove stale Shopify Ecommerce Item rows so a product can be recreated."""
+	if not erpnext_item_codes:
+		return
+
+	for name in frappe.get_all(
+		"Ecommerce Item",
+		filters={
+			"integration": MODULE_NAME,
+			"erpnext_item_code": ("in", list(erpnext_item_codes)),
+		},
+		pluck="name",
+	):
+		frappe.delete_doc("Ecommerce Item", name, force=True, ignore_permissions=True)
+
+
 def unpublish_shopify_product_on_uncheck(doc, template_item) -> None:
 	if not doc.has_value_changed(IS_SHOPIFY_ITEM_FIELD) or doc.get(IS_SHOPIFY_ITEM_FIELD):
 		return
@@ -347,7 +372,7 @@ def unpublish_shopify_product_on_uncheck(doc, template_item) -> None:
 	if not product_id:
 		return
 
-	product = Product.find(product_id)
+	product = get_shopify_product(product_id)
 	if not product:
 		return
 
@@ -357,6 +382,11 @@ def unpublish_shopify_product_on_uncheck(doc, template_item) -> None:
 	write_upload_log(status=is_successful, product=product, item=doc, action="Unpublished")
 	if is_successful:
 		msgprint(_("Status of linked Shopify product is changed to Draft."))
+
+
+def _reactivate_shopify_product(product: Product, setting) -> None:
+	product.status = "active" if setting.sync_new_item_as_active else "draft"
+	product.published = product.status == "active"
 
 
 @temp_shopify_session
@@ -402,7 +432,17 @@ def upload_erpnext_item(doc, method=None):
 		{"erpnext_item_code": template_item.name, "integration": MODULE_NAME},
 		"integration_item_code",
 	)
+
+	product = None
+	if product_id:
+		product = get_shopify_product(product_id)
+		if product is None:
+			# Mapping points at a deleted Shopify product — clear and recreate.
+			delete_shopify_ecommerce_items({item.name, template_item.name})
+			product_id = None
+
 	is_new_product = not bool(product_id)
+	is_recheck = doc.has_value_changed(IS_SHOPIFY_ITEM_FIELD) and bool(doc.get(IS_SHOPIFY_ITEM_FIELD))
 
 	if is_new_product:
 		product = Product()
@@ -465,9 +505,11 @@ def upload_erpnext_item(doc, method=None):
 				ecom_item.insert()
 
 		write_upload_log(status=is_successful, product=product, item=item)
-	elif setting.update_shopify_item_on_update:
-		product = Product.find(product_id)
-		if product:
+	elif product and (setting.update_shopify_item_on_update or is_recheck):
+		if is_recheck:
+			_reactivate_shopify_product(product, setting)
+
+		if setting.update_shopify_item_on_update:
 			map_erpnext_item_to_shopify(shopify_product=product, erpnext_item=template_item)
 			if not item.variant_of:
 				update_default_variant_properties(
@@ -497,11 +539,14 @@ def upload_erpnext_item(doc, method=None):
 						)
 				product.variants.append(Variant(variant_attributes))
 
-			is_successful = product.save()
-			if is_successful and item.variant_of:
-				map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
+		is_successful = product.save()
+		if is_successful and item.variant_of and setting.update_shopify_item_on_update:
+			map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
 
-			write_upload_log(status=is_successful, product=product, item=item, action="Updated")
+		action = "Updated"
+		if is_recheck and not setting.update_shopify_item_on_update:
+			action = "Reactivated"
+		write_upload_log(status=is_successful, product=product, item=item, action=action)
 
 
 def map_erpnext_variant_to_shopify_variant(shopify_product: Product, erpnext_item, variant_attributes):

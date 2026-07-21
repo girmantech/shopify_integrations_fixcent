@@ -1,8 +1,10 @@
 from typing import Optional
 
+import time
+
 import frappe
 from frappe import _, msgprint
-from frappe.utils import cint, cstr
+from frappe.utils import cint, create_batch, cstr
 from frappe.utils.nestedset import get_root_of
 from pyactiveresource.connection import ResourceNotFound
 from shopify.resources import Image, Product, Variant
@@ -19,6 +21,13 @@ from ecommerce_integrations.shopify.constants import (
 	WEIGHT_TO_ERPNEXT_UOM_MAP,
 )
 from ecommerce_integrations.shopify.utils import create_shopify_log
+
+UPLOAD_NEW_ITEMS_JOB = "shopify.job.upload_new_items"
+# Shopify REST product create uses multiple API calls per item; keep batches small
+# and cap work per job so large imports (e.g. 1000 items) chain safely.
+UPLOAD_BATCH_SIZE = 50
+UPLOAD_ITEMS_PER_JOB = 200
+UPLOAD_ITEM_DELAY_SECONDS = 0.5
 
 
 class ShopifyProduct:
@@ -555,6 +564,204 @@ def upload_erpnext_item(doc, method=None):
 	elif product and doc.has_value_changed("image"):
 		# Image-only change while field updates are disabled.
 		sync_item_image_to_shopify(product, item)
+
+
+def get_items_pending_shopify_upload(limit: int | None = None) -> list[str]:
+	"""Return ERPNext items marked for Shopify that are not linked yet.
+
+	Skips template items (has_variants). Variants are included only when
+	"Upload ERPNext Variants as Shopify Items" is enabled.
+	"""
+	setting = frappe.get_cached_doc(SETTING_DOCTYPE)
+	variant_filter = ""
+	if not setting.upload_variants_as_items:
+		variant_filter = "AND item.variant_of IS NULL"
+
+	limit_clause = f"LIMIT {cint(limit)}" if limit else ""
+
+	return frappe.db.sql_list(
+		f"""
+		SELECT item.name
+		FROM `tabItem` item
+		LEFT JOIN `tabEcommerce Item` ei
+			ON ei.erpnext_item_code = item.name
+			AND ei.integration = %(integration)s
+		WHERE ei.name IS NULL
+			AND item.{IS_SHOPIFY_ITEM_FIELD} = 1
+			AND item.has_variants = 0
+			AND item.disabled = 0
+			{variant_filter}
+		ORDER BY item.modified
+		{limit_clause}
+		""",
+		{"integration": MODULE_NAME},
+	)
+
+
+def upload_new_items(force=False) -> None:
+	"""Upload pending ERPNext items to Shopify in batches.
+
+	Picks up items with Is Shopify Item checked that have no Ecommerce Item
+	row yet — including those skipped during Data Import (`frappe.flags.in_import`).
+
+	Processes up to UPLOAD_ITEMS_PER_JOB items per run in batches of
+	UPLOAD_BATCH_SIZE. If more items remain, another background job is enqueued
+	so large imports (e.g. 1000 items) complete across chained jobs.
+
+	Called hourly by the scheduler and manually from Shopify Setting.
+	"""
+	setting = frappe.get_doc(SETTING_DOCTYPE)
+	if not setting.is_enabled() or not setting.upload_erpnext_items:
+		return
+
+	# Fetch one extra to detect whether another job is needed after this run.
+	item_codes = get_items_pending_shopify_upload(limit=UPLOAD_ITEMS_PER_JOB + 1)
+	if not item_codes:
+		return
+
+	has_more = len(item_codes) > UPLOAD_ITEMS_PER_JOB
+	item_codes = item_codes[:UPLOAD_ITEMS_PER_JOB]
+
+	log = create_shopify_log(
+		status="Queued",
+		message=_("Bulk item upload started ({0} items in this job{1})").format(
+			len(item_codes),
+			_(", more pending") if has_more else "",
+		),
+		method="upload_new_items",
+		make_new=True,
+	)
+
+	synced_items: list[str] = []
+	failed_items: list[str] = []
+
+	for batch in create_batch(item_codes, UPLOAD_BATCH_SIZE):
+		for item_code in batch:
+			try:
+				item = frappe.get_doc("Item", item_code)
+				upload_erpnext_item(item)
+
+				if frappe.db.exists(
+					"Ecommerce Item",
+					{"erpnext_item_code": item_code, "integration": MODULE_NAME},
+				):
+					synced_items.append(item_code)
+				else:
+					failed_items.append(item_code)
+			except Exception:
+				failed_items.append(item_code)
+				create_shopify_log(
+					status="Error",
+					message=_("Failed to upload item {0} during bulk sync").format(item_code),
+					method="upload_new_items",
+					make_new=True,
+				)
+			finally:
+				frappe.db.commit()
+				if not frappe.flags.in_test:
+					time.sleep(UPLOAD_ITEM_DELAY_SECONDS)
+
+		# Progress checkpoint after each batch of 50
+		log.db_set(
+			"message",
+			_(
+				"Bulk item upload in progress — synced: {0}, failed: {1}, remaining in job: {2}"
+			).format(
+				len(synced_items),
+				len(failed_items),
+				len(item_codes) - len(synced_items) - len(failed_items),
+			),
+			update_modified=False,
+		)
+
+	if failed_items and synced_items:
+		status = "Partial Success"
+	elif failed_items:
+		status = "Error"
+	else:
+		status = "Success"
+
+	log.status = status
+	log.message = (
+		_("Bulk item upload job completed")
+		+ f"\n{_('Synced')}: {len(synced_items)}"
+		+ f"\n{_('Failed')}: {len(failed_items)}"
+	)
+	if failed_items:
+		# List failures only — synced list can be hundreds of codes.
+		shown = failed_items[:50]
+		log.message += f"\n{_('Failed items')}: {', '.join(shown)}"
+		if len(failed_items) > 50:
+			log.message += _(" (and {0} more)").format(len(failed_items) - 50)
+	if has_more:
+		log.message += "\n" + _("More items pending — queuing next batch job.")
+	log.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	if has_more:
+		_enqueue_upload_job(force=force)
+
+
+def get_pending_shopify_upload_count() -> int:
+	setting = frappe.get_cached_doc(SETTING_DOCTYPE)
+	variant_filter = ""
+	if not setting.upload_variants_as_items:
+		variant_filter = "AND item.variant_of IS NULL"
+
+	return cint(
+		frappe.db.sql(
+			f"""
+			SELECT COUNT(*)
+			FROM `tabItem` item
+			LEFT JOIN `tabEcommerce Item` ei
+				ON ei.erpnext_item_code = item.name
+				AND ei.integration = %(integration)s
+			WHERE ei.name IS NULL
+				AND item.{IS_SHOPIFY_ITEM_FIELD} = 1
+				AND item.has_variants = 0
+				AND item.disabled = 0
+				{variant_filter}
+			""",
+			{"integration": MODULE_NAME},
+		)[0][0]
+	)
+
+
+def _enqueue_upload_job(force: bool = False) -> None:
+	# Unique job name so chained batch jobs are not blocked by the finishing one.
+	frappe.enqueue(
+		upload_new_items,
+		queue="long",
+		timeout=3600,
+		job_name=f"{UPLOAD_NEW_ITEMS_JOB}.{frappe.generate_hash(length=6)}",
+		enqueue_after_commit=True,
+		force=force,
+	)
+
+
+@frappe.whitelist()
+def enqueue_upload_new_items() -> None:
+	"""Queue a background job to upload pending Shopify items."""
+	frappe.only_for("System Manager")
+
+	setting = frappe.get_doc(SETTING_DOCTYPE)
+	if not setting.is_enabled() or not setting.upload_erpnext_items:
+		frappe.throw(_("Enable Shopify and 'Upload new ERPNext Items to Shopify' first."))
+
+	pending_count = get_pending_shopify_upload_count()
+	if not pending_count:
+		frappe.msgprint(_("No pending items to upload to Shopify."))
+		return
+
+	_enqueue_upload_job(force=True)
+	jobs_needed = (pending_count + UPLOAD_ITEMS_PER_JOB - 1) // UPLOAD_ITEMS_PER_JOB
+	frappe.msgprint(
+		_(
+			"Queued upload of {0} item(s) to Shopify — {1} job(s),"
+			" batches of {2}, max {3} items per job."
+			" Check Ecommerce Integration Log for progress."
+		).format(pending_count, jobs_needed, UPLOAD_BATCH_SIZE, UPLOAD_ITEMS_PER_JOB)
+	)
 
 
 def map_erpnext_variant_to_shopify_variant(shopify_product: Product, erpnext_item, variant_attributes):

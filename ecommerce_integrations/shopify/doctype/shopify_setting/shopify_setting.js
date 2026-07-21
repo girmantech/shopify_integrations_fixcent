@@ -29,6 +29,15 @@ frappe.ui.form.on("Shopify Setting", {
 		frm.add_custom_button(__("Import Products"), function () {
 			frappe.set_route("shopify-import-products");
 		});
+		if (frm.doc.enable_shopify && frm.doc.upload_erpnext_items) {
+			frm.add_custom_button(__("Upload Pending Items"), function () {
+				frappe.call({
+					method: "ecommerce_integrations.shopify.product.enqueue_upload_new_items",
+					freeze: true,
+					freeze_message: __("Queueing item upload..."),
+				});
+			});
+		}
 		frm.add_custom_button(__("View Logs"), () => {
 			frappe.set_route("List", "Ecommerce Integration Log", {
 				integration: "Shopify",

@@ -24,6 +24,7 @@ from ecommerce_integrations.shopify.constants import (
 	ORDER_ITEM_DISCOUNT_FIELD,
 	ORDER_NUMBER_FIELD,
 	ORDER_STATUS_FIELD,
+	REFUND_ID_FIELD,
 	SUPPLIER_ID_FIELD,
 )
 from ecommerce_integrations.shopify.utils import (
@@ -156,7 +157,12 @@ class ShopifySetting(SettingController):
 		"""Handle webhook registration/unregistration. Uses appropriate token based on auth method."""
 		import requests
 
-		if self.is_enabled() and not self.webhooks:
+		from ecommerce_integrations.shopify.constants import WEBHOOK_EVENTS
+
+		existing_topics = {w.method for w in self.webhooks}
+		missing_topics = set(WEBHOOK_EVENTS) - existing_topics
+
+		if self.is_enabled() and (not self.webhooks or missing_topics):
 			if self.authentication_method == "OAuth 2.0 Client Credentials":
 				password = self._get_or_generate_oauth_token()
 			else:
@@ -181,6 +187,7 @@ class ShopifySetting(SettingController):
 				msg += _("Disabling and re-enabling the integration might also help.")
 				frappe.throw(msg)
 
+			self.webhooks = []
 			for webhook in new_webhooks:
 				self.append("webhooks", {"webhook_id": webhook.id, "method": webhook.topic})
 
@@ -390,6 +397,14 @@ def setup_custom_fields():
 				read_only=1,
 				print_hide=1,
 			),
+			dict(
+				fieldname=REFUND_ID_FIELD,
+				label="Shopify Refund Id",
+				fieldtype="Data",
+				insert_after=ORDER_STATUS_FIELD,
+				read_only=1,
+				print_hide=1,
+			),
 		],
 		"Sales Invoice": [
 			dict(
@@ -413,6 +428,24 @@ def setup_custom_fields():
 				label="Shopify Order Status",
 				fieldtype="Small Text",
 				insert_after=ORDER_ID_FIELD,
+				read_only=1,
+				print_hide=1,
+			),
+			dict(
+				fieldname=REFUND_ID_FIELD,
+				label="Shopify Refund Id",
+				fieldtype="Data",
+				insert_after=ORDER_STATUS_FIELD,
+				read_only=1,
+				print_hide=1,
+			),
+		],
+		"Payment Entry": [
+			dict(
+				fieldname=REFUND_ID_FIELD,
+				label="Shopify Refund Id",
+				fieldtype="Data",
+				insert_after="reference_no",
 				read_only=1,
 				print_hide=1,
 			),

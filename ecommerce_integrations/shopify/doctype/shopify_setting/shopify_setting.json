@@ -36,6 +36,8 @@
   "column_break_27",
   "sync_delivery_note",
   "sync_sales_invoice",
+  "sync_order_refunds",
+  "submit_credit_notes",
   "add_shipping_as_item",
   "consolidate_taxes",
   "section_break_22",
@@ -262,6 +264,19 @@
    "fieldtype": "Select",
    "label": "Sales Invoice Series",
    "mandatory_depends_on": "eval:doc.sync_sales_invoice"
+  },
+  {
+   "default": "1",
+   "fieldname": "sync_order_refunds",
+   "fieldtype": "Check",
+   "label": "Sync Order Cancellations and Refunds from Shopify"
+  },
+  {
+   "default": "1",
+   "depends_on": "eval:doc.sync_order_refunds==1",
+   "fieldname": "submit_credit_notes",
+   "fieldtype": "Check",
+   "label": "Auto Submit Credit Notes for Refunds"
   },
   {
    "fieldname": "section_break_22",

@@ -35,6 +35,42 @@ def update_inventory_on_shopify() -> None:
 		upload_inventory_data_to_shopify(inventory_levels, warehous_map)
 
 
+def sync_inventory_for_item_codes(item_codes: list[str]) -> None:
+	"""Force-push current ERPNext stock for specific items to Shopify.
+
+	Used after cancel/refund restock so Shopify qty updates immediately
+	instead of waiting for the scheduled inventory job.
+	"""
+	if not item_codes:
+		return
+
+	setting = frappe.get_doc(SETTING_DOCTYPE)
+	if not setting.is_enabled() or not setting.update_erpnext_stock_levels_to_shopify:
+		return
+
+	warehous_map = setting.get_erpnext_to_integration_wh_mapping()
+	if not warehous_map:
+		return
+
+	# Force resync by clearing last sync timestamp for these items
+	ecom_items = frappe.get_all(
+		"Ecommerce Item",
+		filters={
+			"integration": MODULE_NAME,
+			"erpnext_item_code": ["in", list(item_codes)],
+		},
+		pluck="name",
+	)
+	for name in ecom_items:
+		frappe.db.set_value("Ecommerce Item", name, "inventory_synced_on", "1970-01-01 00:00:00")
+
+	inventory_levels = get_shopify_inventory_levels(tuple(warehous_map.keys()))
+	inventory_levels = [d for d in inventory_levels if d.item_code in set(item_codes)]
+
+	if inventory_levels:
+		upload_inventory_data_to_shopify(inventory_levels, warehous_map)
+
+
 def get_shopify_inventory_levels(warehouses: tuple[str]) -> list:
 	inventory_levels = get_inventory_levels(warehouses, MODULE_NAME)
 	if not inventory_levels:

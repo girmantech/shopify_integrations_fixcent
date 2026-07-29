@@ -229,6 +229,127 @@ def set_mapped_item_wise_tax_details(doc, so):
 		doc._item_wise_tax_details = details
 
 
+def set_return_item_wise_tax_details(return_doc, source_doc, detail_field):
+	"""Copy item-wise tax breakup from an SI/DN onto its return document.
+
+	`make_return_doc` copies tax rows but not Item Wise Tax Detail, so
+	india_compliance GST checks fail with "No GST is being charged on Taxable Items".
+
+	Return docs use negative qty/tax amounts — item-wise amounts must be negative too,
+	or ERPNext throws "Item Wise Tax Details do not match" (diff ≈ 2 × tax).
+	"""
+	if not source_doc.meta.get_field("item_wise_tax_details"):
+		_set_return_tax_details_from_json(return_doc, source_doc)
+		_align_return_tax_row_amounts(return_doc)
+		return
+
+	source_details = source_doc.get("item_wise_tax_details") or []
+	if not source_details:
+		_set_return_tax_details_from_json(return_doc, source_doc)
+		_align_return_tax_row_amounts(return_doc)
+		return
+
+	tax_map = {}
+	for src_tax, tax in zip(source_doc.taxes, return_doc.taxes):
+		tax_map[src_tax.name] = tax
+
+	source_items = {d.name: d for d in source_doc.items}
+	item_map = {}
+	for item in return_doc.items:
+		ref = item.get(detail_field)
+		if ref:
+			item_map[ref] = item
+
+	details = []
+	for row in source_details:
+		item = item_map.get(row.item_row)
+		tax = tax_map.get(row.tax_row)
+		source_item = source_items.get(row.item_row)
+		if not (item and tax and source_item):
+			continue
+
+		source_qty = abs(flt(source_item.qty)) or 1
+		return_qty = abs(flt(item.qty))
+		ratio = return_qty / source_qty
+		# Returns are negative; keep sign of return qty
+		sign = -1 if flt(item.qty) < 0 or cint(return_doc.get("is_return")) else 1
+
+		details.append(
+			frappe._dict(
+				item=item,
+				tax=tax,
+				rate=row.rate,
+				amount=abs(flt(row.amount) * ratio) * sign,
+				taxable_amount=abs(flt(row.taxable_amount) * ratio) * sign,
+			)
+		)
+
+	if details:
+		return_doc._item_wise_tax_details = details
+		_align_return_tax_row_amounts(return_doc)
+
+
+def _set_return_tax_details_from_json(return_doc, source_doc):
+	"""Fallback when Item Wise Tax Detail child rows are missing on the source."""
+	item_rows = {d.item_code: d for d in return_doc.items}
+	source_qty = {d.item_code: abs(flt(d.qty)) or 1 for d in source_doc.items}
+
+	tax_by_account = {t.account_head: t for t in return_doc.taxes}
+	details = []
+
+	for tax in source_doc.taxes:
+		if not tax.get("dont_recompute_tax"):
+			continue
+		try:
+			tax_detail = json.loads(tax.item_wise_tax_detail or "{}")
+		except ValueError:
+			continue
+
+		return_tax = tax_by_account.get(tax.account_head)
+		if not return_tax:
+			continue
+
+		for item_code, values in tax_detail.items():
+			item = item_rows.get(item_code)
+			if not item:
+				continue
+			rate, amount = values[0], values[1]
+			ratio = abs(flt(item.qty)) / source_qty.get(item_code, 1)
+			sign = -1 if flt(item.qty) < 0 or cint(return_doc.get("is_return")) else 1
+			details.append(
+				frappe._dict(
+					item=item,
+					tax=return_tax,
+					rate=flt(rate),
+					amount=abs(flt(amount) * ratio) * sign,
+					taxable_amount=flt(item.qty) * flt(item.rate),
+				)
+			)
+
+	if details:
+		return_doc._item_wise_tax_details = details
+
+
+def _align_return_tax_row_amounts(return_doc):
+	"""Force Taxes and Charges amounts to equal item-wise breakup (incl. partial returns)."""
+	from collections import defaultdict
+
+	totals = defaultdict(float)
+	for row in return_doc.get("_item_wise_tax_details") or []:
+		tax = row.get("tax")
+		if tax:
+			totals[tax.name] += flt(row.amount)
+
+	for tax in return_doc.get("taxes") or []:
+		if tax.name not in totals:
+			continue
+		amt = flt(totals[tax.name])
+		tax.tax_amount = amt
+		tax.base_tax_amount = amt
+		tax.tax_amount_after_discount_amount = amt
+		tax.base_tax_amount_after_discount_amount = amt
+
+
 def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
 	items = []
 	all_product_exists = True
@@ -450,47 +571,10 @@ def get_sales_order(order_id):
 
 
 def cancel_order(payload, request_id=None):
-	"""Called by order/cancelled event.
+	"""Called by orders/cancelled webhook. Delegates to refunds handler."""
+	from ecommerce_integrations.shopify.refunds import handle_order_cancelled
 
-	When shopify order is cancelled there could be many different someone handles it.
-
-	Updates document with custom field showing order status.
-
-	IF sales invoice / delivery notes are not generated against an order, then cancel it.
-	"""
-	frappe.set_user("Administrator")
-	frappe.flags.request_id = request_id
-
-	order = payload
-
-	try:
-		order_id = order["id"]
-		order_status = order["financial_status"]
-
-		sales_order = get_sales_order(order_id)
-
-		if not sales_order:
-			create_shopify_log(status="Invalid", message="Sales Order does not exist")
-			return
-
-		sales_invoice = frappe.db.get_value("Sales Invoice", filters={ORDER_ID_FIELD: order_id})
-		delivery_notes = frappe.db.get_list("Delivery Note", filters={ORDER_ID_FIELD: order_id})
-
-		if sales_invoice:
-			frappe.db.set_value("Sales Invoice", sales_invoice, ORDER_STATUS_FIELD, order_status)
-
-		for dn in delivery_notes:
-			frappe.db.set_value("Delivery Note", dn.name, ORDER_STATUS_FIELD, order_status)
-
-		if not sales_invoice and not delivery_notes and sales_order.docstatus == 1:
-			sales_order.cancel()
-		else:
-			frappe.db.set_value("Sales Order", sales_order.name, ORDER_STATUS_FIELD, order_status)
-
-	except Exception as e:
-		create_shopify_log(status="Error", exception=e)
-	else:
-		create_shopify_log(status="Success")
+	handle_order_cancelled(payload, request_id=request_id)
 
 
 @temp_shopify_session

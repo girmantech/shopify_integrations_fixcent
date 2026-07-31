@@ -6,6 +6,7 @@ import json
 
 import frappe
 from frappe import _
+from shopify.collection import PaginatedIterator
 from shopify.resources import Webhook
 from shopify.session import Session
 
@@ -16,6 +17,8 @@ from ecommerce_integrations.shopify.constants import (
 	WEBHOOK_EVENTS,
 )
 from ecommerce_integrations.shopify.utils import create_shopify_log
+
+CALLBACK_PATH = "/api/method/ecommerce_integrations.shopify.connection.store_request_data"
 
 
 def temp_shopify_session(func):
@@ -76,36 +79,105 @@ def _get_access_token(setting):
 		return token
 
 
-def register_webhooks(shopify_url: str, password: str) -> list[Webhook]:
-	"""Register required webhooks with shopify and return registered webhooks."""
-	new_webhooks = []
+def _iter_webhooks():
+	"""Yield all webhooks for the current Shopify session (all pages)."""
+	for page in PaginatedIterator(Webhook.find()):
+		yield from page
 
-	# clear all stale webhooks matching current site url before registering new ones
-	unregister_webhooks(shopify_url, password)
+
+def _webhook_belongs_to_site(webhook, callback_url: str, domain: str) -> bool:
+	address = getattr(webhook, "address", None) or ""
+	if not address:
+		return False
+	if address == callback_url:
+		return True
+	# Domain match covers slight URL drift; still require our callback path so we
+	# do not touch unrelated shop webhooks on the same hostname.
+	return bool(domain) and domain in address and CALLBACK_PATH in address
+
+
+def _existing_webhooks_for_callback(callback_url: str) -> dict[str, Webhook]:
+	"""Map topic -> webhook already registered for this site's callback."""
+	domain = get_current_domain_name()
+	existing = {}
+	for webhook in _iter_webhooks():
+		if _webhook_belongs_to_site(webhook, callback_url, domain):
+			existing[webhook.topic] = webhook
+	return existing
+
+
+def _is_already_taken_error(errors) -> bool:
+	messages = errors if isinstance(errors, (list, tuple)) else [errors]
+	return any("already been taken" in str(message).lower() for message in messages)
+
+
+def register_webhooks(shopify_url: str, password: str) -> list[Webhook]:
+	"""Register required webhooks with shopify and return registered webhooks.
+
+	Idempotent: reuses webhooks that already point at this site's callback URL
+	(avoids Shopify's "address for this topic has already been taken" when the
+	local webhook child table is out of sync with Shopify).
+	"""
+	new_webhooks = []
+	callback_url = get_callback_url()
 
 	with Session.temp(shopify_url, API_VERSION, password):
+		# Drop stale callbacks for this integration on other hosts (old localtunnel URLs)
+		# so Shopify delivers to the current site only.
+		_delete_stale_callbacks(callback_url)
+
+		existing_by_topic = _existing_webhooks_for_callback(callback_url)
+
 		for topic in WEBHOOK_EVENTS:
-			webhook = Webhook.create({"topic": topic, "address": get_callback_url(), "format": "json"})
+			if topic in existing_by_topic:
+				new_webhooks.append(existing_by_topic[topic])
+				continue
+
+			webhook = Webhook.create({"topic": topic, "address": callback_url, "format": "json"})
 
 			if webhook.is_valid():
 				new_webhooks.append(webhook)
-			else:
-				create_shopify_log(
-					status="Error",
-					response_data=webhook.to_dict(),
-					exception=webhook.errors.full_messages(),
-				)
+				continue
+
+			errors = webhook.errors.full_messages()
+			if _is_already_taken_error(errors):
+				# Unregister/list raced or filter missed it — reclaim from Shopify.
+				existing_by_topic = _existing_webhooks_for_callback(callback_url)
+				if topic in existing_by_topic:
+					new_webhooks.append(existing_by_topic[topic])
+					continue
+
+			create_shopify_log(
+				status="Error",
+				response_data=webhook.to_dict(),
+				exception=errors,
+			)
 
 	return new_webhooks
 
 
+def _delete_stale_callbacks(callback_url: str) -> None:
+	"""Remove stale *tunnel* callbacks for this integration.
+
+	Only prunes other localtunnel/ngrok hosts so rotating the tunnel URL does not
+	leave Shopify posting to a dead tunnel. Never deletes production/public hosts.
+	"""
+	for webhook in _iter_webhooks():
+		address = getattr(webhook, "address", None) or ""
+		if CALLBACK_PATH not in address or address == callback_url:
+			continue
+		if ".loca.lt/" in address or ".loca.lt?" in address or address.endswith(".loca.lt") or "ngrok" in address:
+			webhook.destroy()
+
+
 def unregister_webhooks(shopify_url: str, password: str) -> None:
 	"""Unregister all webhooks from shopify that correspond to current site url."""
-	url = get_current_domain_name()
+	callback_url = get_callback_url()
+	domain = get_current_domain_name()
 
 	with Session.temp(shopify_url, API_VERSION, password):
-		for webhook in Webhook.find():
-			if url in webhook.address:
+		for webhook in _iter_webhooks():
+			if _webhook_belongs_to_site(webhook, callback_url, domain):
 				webhook.destroy()
 
 
@@ -127,7 +199,7 @@ def get_callback_url() -> str:
 	"""
 	url = get_current_domain_name()
 
-	return f"https://{url}/api/method/ecommerce_integrations.shopify.connection.store_request_data"
+	return f"https://{url}{CALLBACK_PATH}"
 
 
 @frappe.whitelist(allow_guest=True)

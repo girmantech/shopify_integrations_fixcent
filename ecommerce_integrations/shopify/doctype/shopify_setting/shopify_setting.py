@@ -157,12 +157,10 @@ class ShopifySetting(SettingController):
 		"""Handle webhook registration/unregistration. Uses appropriate token based on auth method."""
 		import requests
 
-		from ecommerce_integrations.shopify.constants import WEBHOOK_EVENTS
-
-		existing_topics = {w.method for w in self.webhooks}
-		missing_topics = set(WEBHOOK_EVENTS) - existing_topics
-
-		if self.is_enabled() and (not self.webhooks or missing_topics):
+		if self.is_enabled():
+			# Always ensure webhooks match the current callback URL. Registration is
+			# idempotent; skipping when the child table is full left localtunnel /
+			# domain changes pointing Shopify at a dead URL with no orders syncing.
 			if self.authentication_method == "OAuth 2.0 Client Credentials":
 				password = self._get_or_generate_oauth_token()
 			else:
